@@ -1,0 +1,11 @@
+[package]
+name = "simple-screen-recorder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.86"
+gtk = { version = "0.8.2", package = "gtk4", features = ["v4_14"] }
+scrap = { git = "https://github.com/rustdesk/rustdesk", version = "0.5.0" }
+tokio = { version = "1.37.0", features = ["full"] }
+webm = { git = "https://github.com/21pages/rust-webm" }
