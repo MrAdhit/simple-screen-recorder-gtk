@@ -1,4 +1,4 @@
-use std::io::{Cursor, ErrorKind};
+use std::io::{Cursor, ErrorKind, Write};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -9,15 +9,17 @@ use gtk::glib::translate::UnsafeFrom as _;
 use gtk::glib::Bytes;
 use gtk::{prelude::*, ApplicationWindow, Button, FileDialog, FileFilter, Paned, Picture};
 use gtk::{glib, Application};
-use scrap::codec::{EncoderApi as _, EncoderCfg, Quality};
-use scrap::{vpxcodec, Capturer, Display, Frame, TraitCapturer as _, TraitPixelBuffer as _, STRIDE_ALIGN};
+use scrap::{Capturer, Display, Frame, TraitCapturer as _, TraitPixelBuffer as _};
 use tokio::runtime::Runtime;
 use tokio::sync::broadcast;
-use webm::mux::Track as _;
+
+use gstreamer::prelude::*;
 
 const APP_ID: &str = "com.mradhit.SimpleScreenRecorder";
 
 fn main() -> glib::ExitCode {
+    gstreamer::init().unwrap();
+
     let app = Application::builder()
         .application_id(APP_ID)
         .build();
@@ -158,58 +160,105 @@ impl ScreenCapturer {
             let should_stop_ptr = should_stop_ptr.clone();
 
             async move {
-                let mut res = Cursor::new(Vec::new());
-                let mut mux = webm::mux::Segment::new(webm::mux::Writer::new(&mut res)).unwrap();
+                let data = Arc::new(Mutex::new(Cursor::new(Vec::new())));
 
-                let (vpx_codec, mux_codec) = (vpxcodec::VpxVideoCodecId::VP9, webm::mux::VideoCodecId::VP9);
+                println!("Setting up encoding pipeline");
 
-                let mut video_track = mux.add_video_track(width as _, height as _, None, mux_codec);
+                let cpu_count = num_cpus::get();
 
-                let mut encoder = vpxcodec::VpxEncoder::new(
-                    EncoderCfg::VPX(vpxcodec::VpxEncoderConfig {
-                        width: width as _,
-                        height: height as _,
-                        quality: Quality::Best,
-                        codec: vpx_codec,
-                        keyframe_interval: None,
-                    }),
-                    false,
-                ).unwrap();
+                let launch = gstreamer::parse::launch(&format!("
+                    appsrc name=input ! rawvideoparse width={width} height={height} format=8 ! videoconvert !
+                    queue leaky=1 max-size-buffers=0 max-size-time=15000000000 max-size-bytes=104857600 !
+                    vp8enc cpu-used={cpu_count} target-bitrate=80000000 ! webmmux ! appsink name=output
+                ")).unwrap();
+
+                let pipeline = launch.dynamic_cast::<gstreamer::Pipeline>().unwrap();
+
+                let input_video_info = gstreamer_video::VideoInfo::builder(gstreamer_video::VideoFormat::Bgrx, width as _, height as _)
+                    .build().unwrap();
+                
+                let input_source =
+                    pipeline.by_name("input").unwrap()
+                        .dynamic_cast::<gstreamer_app::AppSrc>().unwrap();
+
+                input_source.set_caps(Some(&input_video_info.to_caps().unwrap()));
+
+                let output_sink =
+                    pipeline.by_name("output").unwrap()
+                        .dynamic_cast::<gstreamer_app::AppSink>().unwrap();
+
+                let output_callbacks =
+                    gstreamer_app::AppSinkCallbacks::builder()
+                        .new_sample({
+                            let data = data.clone();
+
+                            move |sink| {
+                                let sample = sink.pull_sample().map_err(|_| gstreamer::FlowError::Eos)?;
+                                let buffer = sample.buffer().unwrap();
+    
+                                let mapped = buffer.map_readable().unwrap();
+    
+                                data.lock().unwrap().write(&mapped).unwrap();
+    
+                                Ok(gstreamer::FlowSuccess::Ok)
+                            }
+                        })
+                        .build();
+
+                output_sink.set_callbacks(output_callbacks);
 
                 println!("Starting recorder");
 
-                let mut yuv = Vec::new();
-                let mut mid_data = Vec::new();
-
                 let start = Instant::now();
 
-                loop {
-                    let Ok(frame) = frame_rx.recv().await else { continue };
+                let input_callbacks =
+                    gstreamer_app::AppSrcCallbacks::builder()
+                        .need_data(move |source, _| {
+                            let mut buffer = gstreamer::Buffer::with_size(input_video_info.size()).unwrap();
 
-                    let should_stop = unsafe { *should_stop_ptr.load(Ordering::Acquire) };
+                            loop {
+                                let should_stop = unsafe { *should_stop_ptr.load(Ordering::Acquire) };
 
-                    let frame_time_now = Instant::now();
-                    let frame_time = frame_time_now - start;
+                                if should_stop {
+                                    println!("Stopping recorder...");
+                                    source.end_of_stream().unwrap();
+                                    break;
+                                }
+                                
+                                let Ok(frame) = frame_rx.try_recv() else { continue };
 
-                    let frame = unsafe { &mut *frame.load(Ordering::Acquire) };
+                                let frame = unsafe { &mut *frame.load(Ordering::Acquire) };
 
-                    let ms = frame_time.as_millis();
+                                let scrap::Frame::PixelBuffer(frame) = frame else { continue };
 
-                    frame.to(encoder.yuvfmt(), &mut yuv, &mut mid_data).unwrap();
+                                let frame_time = Instant::now() - start;
+                                buffer.get_mut().unwrap().set_pts(Some(gstreamer::ClockTime::from_seconds_f64(frame_time.as_secs_f64())));
+                                buffer.get_mut().unwrap().copy_from_slice(0, frame.data()).unwrap();
 
-                    for frame in encoder.encode(ms as _, &yuv, STRIDE_ALIGN).unwrap() {
-                        video_track.add_frame(frame.data, (frame.pts * 1_000_000) as _, frame.key);
+                                break;
+                            }
+
+                            let _ = source.push_buffer(buffer);
+                        })
+                        .build();
+                
+                input_source.set_callbacks(input_callbacks);
+
+                pipeline.set_state(gstreamer::State::Playing).unwrap();
+
+                let bus = pipeline.bus().unwrap();
+
+                for msg in bus.iter_timed(gstreamer::ClockTime::NONE) {
+                    match msg.view() {
+                        gstreamer::MessageView::Eos(_) => break,
+                        gstreamer::MessageView::Error(err) => eprintln!("{err}"),
+                        _ => { }
                     }
-
-                    if should_stop {
-                        println!("Stopping recorder");
-                        break
-                    };
                 }
 
-                mux.finalize(None);
+                pipeline.set_state(gstreamer::State::Null).unwrap();
 
-                on_finish(res.into_inner());
+                on_finish(data.lock().unwrap().clone().into_inner());
             }
         });
 
